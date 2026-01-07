@@ -109,65 +109,66 @@ def nll_loss2d_forward_kernel(
     inp_ptr, tgt_ptr, wgt_ptr, out_ptr,
     ignore_index,
     N, C, H, W,
-    # 新增: Strides 参数
     stride_inp_n, stride_inp_c, stride_inp_h, stride_inp_w,
     stride_tgt_n, stride_tgt_h, stride_tgt_w,
     reduction: tl.constexpr = 1,
     BLOCK_SIZE: tl.constexpr = 128,
 ):
-    # 处理 N*H*W 个元素
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
     n_elements = N * H * W
     mask = offsets < n_elements
 
-    # --- 坐标反解: Linear Index -> (n, h, w) ---
+    # --- 坐标反解 ---
     _w = offsets % W
     _h = (offsets // W) % H
     _n = offsets // (W * H)
 
-    # --- Target 读取 (使用 Stride) ---
+    # --- Target 读取 ---
     tgt_offset = _n * stride_tgt_n + _h * stride_tgt_h + _w * stride_tgt_w
+    # 加载 target，保持原类型
     tgt = tl.load(tgt_ptr + tgt_offset, mask=mask, other=0)
     
-    ignore_mask = (tgt != ignore_index) & mask
+    # [关键] 统一转为 int64 进行比较，防止 int32/int64 符号位差异导致 ignore_index 判断失效
+    tgt_i64 = tgt.to(tl.int64)
+    ignore_index_i64 = ignore_index.to(tl.int64)
+    
+    # valid_mask: 在边界内 且 不是忽略下标
+    valid_mask = (tgt_i64 != ignore_index_i64) & mask
+    
+    # 构造安全的 target 索引 (防止越界访问 weight/input)
+    safe_tgt = tl.where(valid_mask, tgt, 0)
 
     # --- Weight 读取 ---
     if wgt_ptr is None:
-        wgt_tgt = ignore_mask.to(tl.float32)
+        # 如果没有 weight，默认权重为 1.0 (float32)
+        wgt_val = 1.0
     else:
-        wgt_tgt = tl.load(wgt_ptr + tgt, mask=ignore_mask, other=0).to(tl.float32)
+        wgt_val = tl.load(wgt_ptr + safe_tgt, mask=valid_mask, other=0).to(tl.float32)
 
-    # --- Input 读取 (使用 Stride) ---
-    # Input Offset = n*s_n + class*s_c + h*s_h + w*s_w
-    inp_offset = _n * stride_inp_n + tgt * stride_inp_c + _h * stride_inp_h + _w * stride_inp_w
-    inp_tgt = tl.load(inp_ptr + inp_offset, mask=ignore_mask, other=0).to(tl.float32)
+    # --- Input 读取 ---
+    inp_offset = _n * stride_inp_n + safe_tgt * stride_inp_c + _h * stride_inp_h + _w * stride_inp_w
+    inp_val = tl.load(inp_ptr + inp_offset, mask=valid_mask, other=0).to(tl.float32)
     
-    out = inp_tgt * wgt_tgt * -1
-
+    # [关键] 显式应用 Mask 清零，双重保险
+    # 如果 valid_mask 为 False，wgt_tgt 和 inp_tgt 理论上是 0，但显式乘法更安全
+    wgt_val = tl.where(valid_mask, wgt_val, 0.0)
+    out_val = inp_val * wgt_val * -1.0
+    
     # --- 输出 ---
-    if reduction == 0:
-        # Output 是新创建的连续 Tensor，直接用 linear offset
-        tl.store(out_ptr + offsets, out, mask=mask)
+    if reduction == 0: # None
+        tl.store(out_ptr + offsets, out_val, mask=mask)
     elif reduction == 1: # Mean
-        total_out = tl.sum(out)
-        total_wgt = tl.sum(wgt_tgt)
-        tl.atomic_add(out_ptr, total_out, sem="relaxed")
-        tl.atomic_add(out_ptr + 1, total_wgt, sem="relaxed")
-        tl.atomic_add(out_ptr + 2, 1, sem="release")
-        
-        counter = tl.load(out_ptr + 2)
-        if counter == tl.num_programs(0):
-            total_out = tl.load(out_ptr)
-            total_wgt = tl.load(out_ptr + 1)
-            if total_wgt == 0:
-                tl.store(out_ptr + 3, 0.0)
-            else:
-                tl.store(out_ptr + 3, total_out / total_wgt)
+        # 块内归约 (float32)
+        block_out = tl.sum(out_val)
+        block_wgt = tl.sum(wgt_val)
+        # 原子加到全局 (float32)
+        tl.atomic_add(out_ptr, block_out, sem="relaxed")
+        tl.atomic_add(out_ptr + 1, block_wgt, sem="relaxed")
     else: # Sum
-        total_out = tl.sum(out)
-        tl.atomic_add(out_ptr, total_out, sem="relaxed")
+        block_out = tl.sum(out_val)
+        tl.atomic_add(out_ptr, block_out, sem="relaxed")
 
 
 @libentry()
@@ -353,22 +354,26 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
     logger.debug("GEMS NLL Loss2d FWD")
     assert self.ndim == 4
     N, C, H, W = self.shape
-    assert list(target.shape) == [N, H, W]
-
-    # 不再强制 self.contiguous() 和 target.contiguous()
-    # Weight 通常很小，保持 contiguous 以简化逻辑
+    
     weight = None if weight is None else weight.contiguous()
 
+    # 初始化 Output Buffer
     if reduction == 0:
         out = torch.empty((N, H, W), dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = torch.zeros([4], dtype=torch.float32, device=self.device)
+        # Mean: [total_loss, total_weight]
+        out = torch.zeros([2], dtype=torch.float32, device=self.device)
     else:
-        out = torch.zeros([], dtype=torch.float32, device=self.device)
+        # Sum: [total_loss]
+        out = torch.zeros([1], dtype=torch.float32, device=self.device)
 
-    # 获取 Strides
     s_n, s_c, s_h, s_w = self.stride()
     t_s_n, t_s_h, t_s_w = target.stride()
+
+    # 确保 ignore_index 是 Python int，Triton 会将其作为 scalar 处理
+    # 如果它是 Tensor，需要取 .item()
+    if isinstance(ignore_index, torch.Tensor):
+        ignore_index = int(ignore_index.item())
 
     grid = lambda meta: (triton.cdiv(N * H * W, meta["BLOCK_SIZE"]),)
     
@@ -377,19 +382,31 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
             self, target, weight, out,
             ignore_index,
             N, C, H, W,
-            # 传入 Strides
             s_n, s_c, s_h, s_w,
             t_s_n, t_s_h, t_s_w,
             reduction
         )
 
+    # 后处理
     if reduction == 0:
         return out, torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = out.to(self.dtype)
-        return out[3], out[1]
-    else:
-        return out.to(self.dtype), torch.empty([], dtype=self.dtype, device=self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        
+        total_loss = out[0]
+        total_weight = out[1]
+        
+        if total_weight == 0:
+            output = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        else:
+            output = total_loss / total_weight
+            
+        return output.to(self.dtype), total_weight.to(self.dtype)
+    else: # Sum
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        return out[0].to(self.dtype), torch.empty([], dtype=self.dtype, device=self.device)
 
 
 def nll_loss2d_backward(grad_output, self, target, weight=None, reduction=1, ignore_index=-100, total_weight=None):

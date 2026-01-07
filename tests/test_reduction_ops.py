@@ -229,13 +229,34 @@ def test_accuracy_cross_entropy_loss_probabilities(
     gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
 
 
+def make_non_contiguous(t):
+    if t is None:
+        return None
+    # 策略：在最后一个维度上把尺寸翻倍，然后隔一个取一个
+    # 比如 shape (2, 3) -> 申请 (2, 6) -> 切片取 [..., ::2] -> 得到 (2, 3) 但 stride 变了
+    shape = list(t.shape)
+    if len(shape) == 0: # scalar
+        return t
+    
+    shape[-1] *= 2
+    # 创建一个更大的 buffer
+    storage = torch.empty(shape, dtype=t.dtype, device=t.device)
+    # 获取切片视图 (此时是 non-contiguous 的)
+    non_contig_view = storage[..., ::2]
+    # 把原数据拷贝进去
+    non_contig_view.copy_(t)
+    return non_contig_view
+
 @pytest.mark.nll_loss
 @pytest.mark.parametrize("reduction", ["mean", "none", "sum"])
+# @pytest.mark.parametrize("reduction", ["mean"])
 @pytest.mark.parametrize("weight", [True, False])
-@pytest.mark.parametrize("shape", REDUCTION_SHAPES)
+@pytest.mark.parametrize("shape", REDUCTION_SHAPES + [(8, 2, 100, 100), (16, 100, 200, 200)])
+# @pytest.mark.parametrize("shape", [(8, 2, 100, 100), (16, 100, 200, 200)])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize("ignore_index", [1, 200, -100])
-def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight):
+@pytest.mark.parametrize("is_contiguous", [True, False])
+def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight, is_contiguous):
     if flag_gems.vendor_name == "kunlunxin":
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -246,12 +267,40 @@ def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight):
     target_shape = list(shape)
     del target_shape[dim]
 
-    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device, requires_grad=True)
-    target = torch.randint(0, shape[dim], target_shape, device=flag_gems.device)
+    # 1. 创建原始数据 (此时先不要 requires_grad，因为我们要先处理内存布局)
+    inp_data = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    target_data = torch.randint(0, shape[dim], target_shape, device=flag_gems.device)
+    
     if weight:
-        weight = torch.randn(shape[dim], dtype=dtype, device=flag_gems.device)
+        weight_data = torch.randn(shape[dim], dtype=dtype, device=flag_gems.device)
     else:
-        weight = None
+        weight_data = None
+
+    # 2. 根据参数决定是否转换为非连续 Tensor
+    if not is_contiguous:
+        inp = make_non_contiguous(inp_data)
+        target = make_non_contiguous(target_data)
+        weight = make_non_contiguous(weight_data)
+        
+        # 验证一下是否真的非连续 (Debug用)
+        # assert not inp.is_contiguous()
+        # assert not target.is_contiguous()
+    else:
+        inp = inp_data
+        target = target_data
+        weight = weight_data
+
+    # 3. 开启梯度 (必须在处理完内存布局后开启，否则操作会被记录进计算图)
+    inp.requires_grad_(True)
+    # Retain grad for non-leaf tensor if created by slicing (though copy_ makes it leaf-like regarding data, 
+    # but strictly speaking make_non_contiguous returns a view or slice. 
+    # For robust testing, we can treat inp as the leaf.)
+    # 注意：上面的 make_non_contiguous 写法中，storage 是 leaf，non_contig_view 是 view。
+    # 为了让 inp 成为 leaf node 且保留非连续性，我们可以 detach 一下或者直接用:
+    if not is_contiguous:
+        inp = inp.detach().requires_grad_(True)
+        # Detach 后它依然是非连续的，可以作为计算图叶子节点
+
     ref_inp = to_reference(inp, True)
     ref_target = to_reference(target)
     ref_weight = to_reference(weight, True)
@@ -259,18 +308,28 @@ def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight):
     ref_out = torch.nn.functional.nll_loss(
         ref_inp, ref_target, ref_weight, reduction=reduction, ignore_index=ignore_index
     )
+    
     with flag_gems.use_gems():
+        # 这里传入的 inp 可能是非连续的
         res_out = torch.nn.functional.nll_loss(
             inp, target, weight, reduction=reduction, ignore_index=ignore_index
         )
+    
     reduce_dim = 1 if reduction == "none" else target.numel()
     gems_assert_close(res_out, ref_out, dtype, reduce_dim=reduce_dim, equal_nan=True)
 
+    # Backward 测试
     out_grad = torch.randn_like(res_out)
+    # 对 grad 也做一下非连续处理，测试 backward kernel 对 out_grad stride 的支持
+    if not is_contiguous:
+        out_grad = make_non_contiguous(out_grad)
+
     ref_grad = to_reference(out_grad, True)
     (ref_in_grad,) = torch.autograd.grad(ref_out, ref_inp, ref_grad)
+    
     with flag_gems.use_gems():
         (res_in_grad,) = torch.autograd.grad(res_out, inp, out_grad)
+        
     gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
 
 
