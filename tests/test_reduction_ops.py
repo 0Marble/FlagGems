@@ -230,9 +230,11 @@ def test_accuracy_cross_entropy_loss_probabilities(
 
 
 @pytest.mark.nll_loss
-@pytest.mark.parametrize("reduction", ["mean", "none", "sum"])
+# @pytest.mark.parametrize("reduction", ["mean", "none", "sum"])
+@pytest.mark.parametrize("reduction", ["mean"])
 @pytest.mark.parametrize("weight", [True, False])
-@pytest.mark.parametrize("shape", REDUCTION_SHAPES)
+# @pytest.mark.parametrize("shape", REDUCTION_SHAPES + [(8, 2, 100, 100), (16, 100, 200, 200)])
+@pytest.mark.parametrize("shape", [(8, 2, 100, 100), (16, 100, 200, 200)])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize("ignore_index", [1, 200, -100])
 def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight):

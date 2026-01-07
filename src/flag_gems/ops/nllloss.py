@@ -333,15 +333,21 @@ def nll_loss_backward(
 # 3d+ tensor
 def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100):
     logger.debug("GEMS NLL Loss2d FWD")
-    assert self.ndim == 4, "Invalid input ndim"
-
-    shape = list(target.shape)
-    N, C, _, D = self.shape
-    assert shape == [N, 1, D], "Invalid target size"
 
     self = self.contiguous()
     target = target.contiguous()
     weight = None if weight is None else weight.contiguous()
+
+    p = 1
+    for i in range(2, len(self.shape)): p *= self.shape[i]
+
+    orig_target_shape = target.shape
+    self = self.flatten(start_dim=2)
+    target = target.flatten(start_dim=1)
+    N, C, D = self.shape
+    assert target.shape == (N, D), "Invalid target size"
+    assert D == p
+    shape = target.shape
 
     if reduction == 0:
         out = torch.empty(shape, dtype=self.dtype, device=self.device)
@@ -364,14 +370,15 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
 
     # redution: 0-None, 1-mean, 2-sum
     if reduction == 0:
-        output = out
+        assert out.shape == (N, D)
+        output = out.reshape(orig_target_shape)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
         out = out.to(self.dtype)
         output = out[3]
         total_weight = out[1]
     else:
-        output = out.to(self.dtype)
+        output = out.to(self.dtype).reshape(orig_target_shape)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
 
     return output, total_weight
