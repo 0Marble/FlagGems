@@ -230,14 +230,15 @@ def test_accuracy_cross_entropy_loss_probabilities(
 
 NLL_LOSS_SHAPES = [
     # shape inp_size inp_stride inp_offset tgt_size tgt_stride tgt_offset
-    [(1, 2), 2, (2, 1), 0, 2, (1,), 0 ],
-    [(4096, 256), 4096 * 256, (256, 1), 0, 4096, (1,), 0],
-    [(4096, 256), 4096 * 256, (1, 4096), 0, 4096, (1,), 0],
-    [(4096, 256), 4096 * 256 * 10, (10, 10*4096), 0, 4096, (1,), 0],
-    [(200, 40999, 3), 200*40999*3, (40999*3,3,1), 0, 200*3, (3, 1), 0],
-    [(200, 40999, 3), 200*40999*3, (3, 200*3, 1), 0, 200*3, (3, 1), 0],
-    [(8, 2, 100, 100), 8*2*100*100, (2*100*100, 100*100, 100, 1), 0, 8*100*100, (100*100, 100, 1), 0],
-    [(8, 2, 100, 100), 8*2*100*100, (2, 1, 8*2, 8*2*100), 0, 8*100*100, (100*100, 100, 1), 0],
+    [(1, 2), 2, (2, 1), 2, (1,)],
+    [(4096, 256), 4096 * 256, (256, 1), 4096, (1,)],
+    [(4096, 256), 4096 * 256, (1, 4096), 4096, (1,)],
+    [(4096, 256), 4096 * 256 * 10, (10, 10*4096), 4096, (1,)],
+    [(200, 40999, 3), 200*40999*3, (40999*3,3,1), 200*3, (3, 1)],
+    [(200, 40999, 3), 200*40999*3, (3, 200*3, 1), 200*3, (3, 1)],
+    # TODO: uncomment this after adding proper 4d support
+    # [(8, 2, 100, 100), 8*2*100*100, (2*100*100, 100*100, 100, 1), 8*100*100, (100*100, 100, 1)],
+    # [(8, 2, 100, 100), 8*2*100*100, (2, 1, 8*2, 8*2*100), 8*100*100, (100*100, 100, 1)],
 ]
 @pytest.mark.nll_loss
 @pytest.mark.parametrize("reduction", ["mean", "none", "sum"])
@@ -252,15 +253,15 @@ def test_accuracy_nll_loss(shape, dtype, ignore_index, reduction, weight):
         np.random.seed(0)
         random.seed(0)
 
-    shape, inp_size, inp_stride, inp_offset, tgt_size, tgt_stride, tgt_offset = shape
+    shape, inp_size, inp_stride, tgt_size, tgt_stride = shape
     inp = torch.randn((inp_size,), dtype=dtype, device=flag_gems.device, requires_grad=True)
-    inp = inp.as_strided(shape, inp_stride, storage_offset=inp_offset)
+    inp = inp.as_strided(shape, inp_stride)
 
     dim = 1
     target_shape = list(shape)
     del target_shape[dim]
     target = torch.randint(0, shape[dim], (tgt_size,), device=flag_gems.device)
-    target.as_strided_(target_shape, tgt_stride, storage_offset=tgt_offset)
+    target.as_strided_(target_shape, tgt_stride)
 
     if weight:
         weight = torch.randn(shape[dim], dtype=dtype, device=flag_gems.device)

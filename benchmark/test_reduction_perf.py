@@ -549,3 +549,48 @@ def test_perf_scaled_softmax_backward():
     )
     bench.set_gems(flag_gems.scaled_softmax_backward)
     bench.run()
+
+
+class NllLoss2DBenchmark(GenericBenchmark):
+    def get_input_iter(self, cur_dtype) -> Generator:
+        NLL_LOSS_SHAPES = [
+            # shape inp_size inp_stride tgt_size tgt_stride
+            # TODO: dummy 3rd dimension since current upstream expects it to be =1
+            [(200, 40999, 1, 3), 200*40999*3, (40999*3,3,1,1), 200*3, (3, 1,1)],
+            [(200, 40999, 1, 3), 200*40999*3, (3, 200*3, 1,1), 200*3, (3, 1,1)],
+            # TODO: uncomment this after adding proper 4d support
+            # [(8, 2, 100, 100), 8*2*100*100, (2*100*100, 100*100, 100, 1), 8*100*100, (100*100, 100, 1)],
+            # [(8, 2, 100, 100), 8*2*100*100, (2, 1, 8*2, 8*2*100), 8*100*100, (100*100, 100, 1)],
+        ]
+        for shape in NLL_LOSS_SHAPES:
+            yield from self.input_fn(shape, cur_dtype, self.device)
+
+@pytest.mark.nll_loss2d
+def test_perf_nll_loss2d_forward():
+    def input_fn(shape, dtype, device):
+        shape, inp_size, inp_stride, tgt_size, tgt_stride = shape
+        x = generate_tensor_input((inp_size, ), dtype, device)
+        x = x.as_strided(shape, inp_stride)
+        
+        tgt_shape = list(shape)
+        C = tgt_shape[1]
+        del tgt_shape[1]
+        y = torch.randint(0, C, (tgt_size,), device=device)
+        y = y.as_strided(tgt_shape, tgt_stride)
+
+        weight = torch.randn((C,), device=device, dtype=dtype)
+
+        for w in [None, weight]:
+            for ignored in [-100, 1, 200]:
+                for reduction in ["none", "sum", "mean"]:
+                    yield x, y, {"weight": w, "ignore_index": ignored, "reduction": reduction}
+
+    bench = NllLoss2DBenchmark(
+        input_fn=input_fn,
+        op_name="nll_loss2d",
+        torch_op=torch.nn.functional.nll_loss,
+        dtypes=FLOAT_DTYPES,
+    )
+    bench.set_gems(flag_gems.nll_loss2d_forward)
+    bench.run()
+
