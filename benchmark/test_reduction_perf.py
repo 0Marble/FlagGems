@@ -555,12 +555,10 @@ class NllLoss2DBenchmark(GenericBenchmark):
     def get_input_iter(self, cur_dtype) -> Generator:
         NLL_LOSS_SHAPES = [
             # shape inp_size inp_stride tgt_size tgt_stride
-            # TODO: dummy 3rd dimension since current upstream expects it to be =1
-            [(200, 40999, 1, 3), 200*40999*3, (40999*3,3,1,1), 200*3, (3, 1,1)],
-            [(200, 40999, 1, 3), 200*40999*3, (3, 200*3, 1,1), 200*3, (3, 1,1)],
-            # TODO: uncomment this after adding proper 4d support
-            # [(8, 2, 100, 100), 8*2*100*100, (2*100*100, 100*100, 100, 1), 8*100*100, (100*100, 100, 1)],
-            # [(8, 2, 100, 100), 8*2*100*100, (2, 1, 8*2, 8*2*100), 8*100*100, (100*100, 100, 1)],
+            [(200, 40999, 3), 200*40999*3, (40999*3, 3, 1), 200*3, (3, 1)],
+            [(200, 40999, 3), 200*40999*3, (3, 200*3, 1), 200*3, (3, 1)],
+            [(8, 2, 100, 100), 8*2*100*100, (2*100*100, 100*100, 100, 1), 8*100*100, (100*100, 100, 1)],
+            [(8, 2, 100, 100), 8*2*100*100, (2, 1, 8*2, 8*2*100), 8*100*100, (100*100, 100, 1)],
         ]
         for shape in NLL_LOSS_SHAPES:
             yield from self.input_fn(shape, cur_dtype, self.device)

@@ -371,14 +371,14 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
     # redution: 0-None, 1-mean, 2-sum
     if reduction == 0:
         assert out.shape == (N, D)
-        output = out.reshape(orig_target_shape)
+        output = out.flatten().reshape(orig_target_shape)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
         out = out.to(self.dtype)
         output = out[3]
         total_weight = out[1]
     else:
-        output = out.to(self.dtype).reshape(orig_target_shape)
+        output = out.to(self.dtype)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
 
     return output, total_weight
