@@ -116,12 +116,14 @@ def cross_entropy_loss_input_fn(shape, cur_dtype, device):
 
 
 def nll_loss_input_fn(shape, cur_dtype, device):
-    inp = generate_tensor_input(shape, cur_dtype, device)
+    inp = generate_tensor_input(shape, cur_dtype, device).requires_grad_(True)
     target = torch.randint(0, shape[-1], (shape[0],), device=device)
     yield inp, target
     if Config.bench_level == BenchLevel.COMPREHENSIVE:
         weight = torch.randn(shape[-1], dtype=cur_dtype, device=device)
         yield inp, target, {"weight": weight, "ignore_index": 1, "reduction": "none"}
+        yield inp, target, {"weight": weight, "reduction": "mean"}
+        yield inp, target, {"weight": weight, "reduction": "sum"}
 
 
 def cumsum_input_fn(shape, cur_dtype, device):
@@ -585,10 +587,57 @@ def test_perf_nll_loss2d_forward():
 
     bench = NllLoss2DBenchmark(
         input_fn=input_fn,
-        op_name="nll_loss2d",
+        op_name="nll_loss2d_forward",
         torch_op=torch.nn.functional.nll_loss,
         dtypes=FLOAT_DTYPES,
     )
     bench.set_gems(flag_gems.nll_loss2d_forward)
     bench.run()
 
+@pytest.mark.nll_loss2d
+def test_perf_nll_loss2d_backward():
+    def input_fn(shape, dtype, device):
+        shape, inp_size, inp_stride, tgt_size, tgt_stride = shape
+
+        x = generate_tensor_input((inp_size, ), dtype, device)
+        x = x.as_strided(shape, inp_stride)
+        
+        tgt_shape = list(shape)
+        C = tgt_shape[1]
+        del tgt_shape[1]
+        y = torch.randint(0, C, (tgt_size,), device=device)
+        y = y.as_strided(tgt_shape, tgt_stride)
+
+        weight = torch.randn((C,), device=device, dtype=dtype)
+
+        for w in [None, weight]:
+            for ignored in [-100, 1]: 
+                for reduction_str in ["none", "sum", "mean"]:
+                    res_map = {"none": 0, "mean": 1, "sum": 2}
+                    reduction = res_map[reduction_str]
+
+                    with torch.no_grad():
+                        output, total_weight = flag_gems.nll_loss2d_forward(
+                            x, y, weight=w, reduction=reduction, ignore_index=ignored
+                        )
+                        
+                        if reduction_str == "none":
+                            grad_output = torch.randn_like(output)
+                        else:
+                            grad_output = torch.randn([], dtype=dtype, device=device)
+
+                    yield grad_output, x, y, {
+                        "weight": w, 
+                        "reduction": reduction, 
+                        "ignore_index": ignored, 
+                        "total_weight": total_weight
+                    }
+
+    bench = NllLoss2DBenchmark(
+        input_fn=input_fn,
+        op_name="nll_loss2d_backward",
+        torch_op=flag_gems.nll_loss2d_backward, 
+        dtypes=FLOAT_DTYPES,
+    )
+
+    bench.run()

@@ -330,48 +330,38 @@ def nll_loss_backward(
     return grad_input
 
 
-# 3d+ tensor
 def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100):
     logger.debug("GEMS NLL Loss2d FWD")
+    
+    # 1. 记录原始形状，用于还原输出
+    orig_target_shape = target.shape  # 例如 (8, 100, 100)
 
-    self = self.contiguous()
-    target = target.contiguous()
-    weight = None if weight is None else weight.contiguous()
+    # 2. 关键：flatten + contiguous
+    # 将 (N, C, H, W) 统一为标准连续的 (N, C, D)
+    self_flat = self.flatten(start_dim=2).contiguous()
+    target_flat = target.flatten(start_dim=1).contiguous()
+    if weight is not None:
+        weight = weight.contiguous()
 
-    p = 1
-    for i in range(2, len(self.shape)): p *= self.shape[i]
+    N, C, D = self_flat.shape  # 此时 D = H * W = 10000
 
-    orig_target_shape = target.shape
-    self = self.flatten(start_dim=2)
-    target = target.flatten(start_dim=1)
-    N, C, D = self.shape
-    assert target.shape == (N, D), "Invalid target size"
-    assert D == p
-    shape = target.shape
-
-    if reduction == 0:
-        out = torch.empty(shape, dtype=self.dtype, device=self.device)
-    elif reduction == 1:
-        out = torch.zeros(
-            [
-                4,
-            ],
-            dtype=torch.float32,
-            device=self.device,
-        )
-    else:
+    # 3. 准备输出张量
+    if reduction == 0:  # None
+        out = torch.empty((N, D), dtype=self.dtype, device=self.device)
+    elif reduction == 1:  # Mean
+        out = torch.zeros([4], dtype=torch.float32, device=self.device)
+    else:  # Sum
         out = torch.zeros([], dtype=torch.float32, device=self.device)
 
     grid = lambda meta: (triton.cdiv(N * D, meta["BLOCK_ND"]),)
     with torch_device_fn.device(self.device):
         nll_loss2d_forward_kernel[grid](
-            self, target, weight, out, ignore_index, N, C, D, reduction
+            self_flat, target_flat, weight, out, ignore_index, N, C, D, reduction
         )
 
-    # redution: 0-None, 1-mean, 2-sum
     if reduction == 0:
-        assert out.shape == (N, D)
-        output = out.flatten().reshape(orig_target_shape)
+        # 还原回高维形状 (N, H, W, ...)
+        output = out.reshape(orig_target_shape)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
         out = out.to(self.dtype)
@@ -379,9 +369,10 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
         total_weight = out[1]
     else:
         output = out.to(self.dtype)
-        total_weight = torch.empty([], dtype=self.dtype, device=self.device)
+        total_weight = torch.zeros([], dtype=self.dtype, device=self.device)
 
     return output, total_weight
+
 
 
 def nll_loss2d_backward(
@@ -394,27 +385,40 @@ def nll_loss2d_backward(
     total_weight=None,
 ):
     logger.debug("GEMS NLL Loss2d BWD")
-    N, C, _, D = self.shape
+    
+    N, C = self.shape[0], self.shape[1]
+    spatial_dims = target.shape[1:]  
+    logical_N = target.numel()
+
+    target_flat = target.flatten().contiguous()
+    if weight is not None:
+        weight = weight.contiguous()
+
+    grad_input_flat = torch.zeros((logical_N, C), dtype=self.dtype, device=self.device)
 
     grad_output = grad_output.contiguous()
-    target = target.contiguous()
-    weight = None if weight is None else weight.contiguous()
 
-    grad_input = torch.zeros_like(self).contiguous()
-
-    grid = lambda meta: (triton.cdiv(N * D, meta["BLOCK_ND"]),)
+    grid = lambda meta: (triton.cdiv(logical_N, meta["BLOCK_N"]),)
     with torch_device_fn.device(self.device):
-        nll_loss2d_backward_kernel[grid](
+        nll_loss_backward_kernel[grid](
             grad_output,
-            target,
+            target_flat,
             weight,
-            grad_input,
+            grad_input_flat,
             ignore_index,
             total_weight,
-            N,
+            logical_N,
             C,
-            D,
             reduction,
         )
 
+    grad_input_reshaped = grad_input_flat.view(N, *spatial_dims, C)
+    
+    input_ndim = grad_input_reshaped.ndim
+    dims = list(range(input_ndim))
+    last_dim = dims.pop(-1)
+    dims.insert(1, last_dim)
+    
+    grad_input = grad_input_reshaped.permute(*dims).contiguous()
+    
     return grad_input
